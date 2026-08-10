@@ -1,0 +1,24 @@
+# GitHub actions workflow.
+# https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax
+
+name: Mirror
+
+# Update the mirror once a day.
+on:
+  schedule:
+  - cron: '11 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: 1
+    steps:
+    - uses: actions/checkout@v7
+    - run: ./mirror-upstream -w .
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

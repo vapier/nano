@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+# Distributed under the terms of the GNU General Public License v3
+
+"""Mirror upstream nano and sync it to our GH copy.
+
+But try to do it efficiently.
+"""
+
+import argparse
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+
+
+THIS_SCRIPT = Path(__file__).resolve()
+THIS_DIR = THIS_SCRIPT.parent
+
+# NB: Pull from git:// since https:// is much slower & flakes a lot.
+# It might be insecure, but who could possibly be MITM-ing GH & GNU !?
+UPSTREAM_REPO = "git://git.sv.gnu.org/nano"
+DOWNSTREAM_REPO = "https://github.com/vapier/nano"
+DOWNSTREAM_REPO_SSH = "git@github.com:vapier/nano"
+
+
+def parse_refs(output: str) -> dict[str, str]:
+    """Parse ls-remote output and return a dict mapping refs to commit."""
+    # print(*(x.split("\t") for x in output.splitlines()))
+    return dict(reversed(x.split("\t")) for x in output.splitlines())
+
+
+def git(cwd: Path, cmd: list[str]) -> str:
+    """Run a git command and return its stdout."""
+    print("+ git", shlex.join(cmd))
+    result = subprocess.run(
+        ["git"] + cmd, cwd=cwd, check=True, stdout=subprocess.PIPE, encoding="utf-8"
+    )
+    return result.stdout
+
+
+def get_parser() -> argparse.ArgumentParser:
+    """Get CLI parser."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "-n",
+        "--dry-run",
+        dest="dryrun",
+        action="store_true",
+        help="Do everything but the final push",
+    )
+    parser.add_argument(
+        "--source-repo",
+        "--src",
+        default=UPSTREAM_REPO,
+        help="Repo to sync from (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--destination-repo",
+        "--dst",
+        default=DOWNSTREAM_REPO,
+        help="Repo to mirror to (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--push-repo",
+        default=(
+            DOWNSTREAM_REPO if "GITHUB_TOKEN" in os.environ else DOWNSTREAM_REPO_SSH
+        ),
+        help="Repo to mirror to (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-w",
+        "--working-dir",
+        type=Path,
+        default=THIS_DIR / "working-mirror",
+        help="Directory to use for mirroring code (default: %(default)s)",
+    )
+    return parser
+
+
+def main(argv: list[str]) -> int | None:
+    """The main entry point for scripts."""
+    parser = get_parser()
+    opts = parser.parse_args(argv)
+
+    d = opts.working_dir
+    print("Working dir:", d)
+    d.mkdir(exist_ok=True)
+    git(d, ["init", "-b", "master"])
+    git(d, ["config", "remote.origin.url", opts.destination_repo])
+    git(d, ["config", "remote.origin.pushurl", opts.push_repo])
+    git(d, ["config", "remote.mirror.url", opts.source_repo])
+
+    src_refs = parse_refs(git(d, ["ls-remote", "-b", "-t", "mirror"]))
+    dst_refs = parse_refs(git(d, ["ls-remote", "-b", "-t", "origin"]))
+    stale_refs = sorted(
+        ref for ref, commit in src_refs.items() if dst_refs.get(ref, None) != commit
+    )
+    if not stale_refs:
+        print("Up-to-date!  Nothing to do!")
+        return 0
+
+    print("Updating refs from upstream:")
+    print("".join(f"\t{x}\n" for x in stale_refs), end="")
+
+    # Most updates will be to the master branch, so sync that as our base.
+    git(
+        d,
+        [
+            "fetch",
+            "--no-tags",
+            "origin",
+            "+refs/heads/master:refs/remotes/origin/master",
+        ],
+    )
+
+    # Walk over each missing ref: fetch the commit & push it over.
+    git_dryrun = ["--dry-run"] if opts.dryrun else []
+    for ref in stale_refs:
+        if ref.endswith("^{}"):
+            # Skip annotated tags as pushing the base tag should cover it.
+            continue
+
+        commit = src_refs[ref]
+        try:
+            git(d, ["cat-file", "-e", commit])
+        except subprocess.CalledProcessError:
+            git(d, ["fetch", "mirror", commit])
+        git(d, ["push", "origin", f"{commit}:{ref}"] + git_dryrun)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
