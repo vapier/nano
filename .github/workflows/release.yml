@@ -1,0 +1,244 @@
+# GitHub actions workflow.
+# https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax
+
+name: Release
+
+on:
+  push:
+    branches: [master, vapier/*]
+    tags: [v*]
+
+jobs:
+  gnulib:
+    runs-on: ubuntu-latest
+    steps:
+    # If building on vapier/ branches, force master.  Otherwise, use the current
+    # ref to build as it'll be a release tag.
+    - uses: actions/checkout@v7
+      if: ${{ startsWith(github.ref, 'refs/heads/vapier/') }}
+      with:
+        ref: refs/heads/master
+    - uses: actions/checkout@v7
+      if: ${{ ! startsWith(github.ref, 'refs/heads/vapier/') }}
+
+    # Cache gnulib to avoid hitting slow GNU git servers on every run.
+    - name: Hash lookup
+      id: hash-lookup
+      run: grep ^gnulib_hash= autogen.sh | tr -d '"' >> $GITHUB_OUTPUT
+    - name: Check cache
+      id: cache-lookup
+      uses: actions/cache@v6
+      with:
+        key: gnulib-${{ steps.hash-lookup.outputs.gnulib_hash }}
+        path: gnulib
+        lookup-only: true
+    - name: Fetch gnulib
+      if: steps.cache-lookup.outputs.cache-hit != 'true'
+      run: |
+        set -x
+        mkdir -p gnulib
+        cd gnulib
+        git init -b main
+        hash=${{ steps.hash-lookup.outputs.gnulib_hash }}
+        if ! git cat-file -e "$hash"; then
+          git fetch git://git.sv.gnu.org/gnulib.git "$hash"
+        fi
+        git checkout -f "$hash"
+    - uses: actions/cache/save@v6
+      if: steps.cache-lookup.outputs.cache-hit != 'true'
+      with:
+        key: ${{ steps.hash-lookup.outputs.gnulib_hash }}
+        path: gnulib
+
+  pdcurses:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check cache
+      id: cache-lookup
+      uses: actions/cache@v6
+      with:
+        key: pdcurses-x86_64-w64-mingw32-3.9
+        path: PDCurses/curses.h
+        lookup-only: true
+    - name: Install dependencies
+      if: steps.cache-lookup.outputs.cache-hit != 'true'
+      run: |
+        set -x
+        sudo apt-get update
+        sudo apt-get install -y mingw-w64
+    - uses: actions/checkout@v7
+      if: steps.cache-lookup.outputs.cache-hit != 'true'
+      with:
+        repository: wmcbrine/PDCurses
+        ref: refs/tags/3.9
+        path: PDCurses
+    - run: make -O -j4 CC=x86_64-w64-mingw32-gcc AR=x86_64-w64-mingw32-ar
+      if: steps.cache-lookup.outputs.cache-hit != 'true'
+      working-directory: PDCurses/wincon
+    - name: Cache lib
+      if: steps.cache-lookup.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        key: pdcurses-x86_64-w64-mingw32-3.9
+        path: |
+          PDCurses/curses.h
+          PDCurses/panel.h
+          PDCurses/wincon/pdcurses.a
+
+  Linux:
+    runs-on: ubuntu-latest
+    needs: [gnulib, pdcurses]
+    steps:
+    - run: sudo apt-get update
+    - run: |
+        sudo apt-get install -y \
+          autoconf \
+          automake \
+          autopoint \
+          gettext \
+          m4 \
+          mingw-w64
+
+    # If building on vapier/ branches, force master.  Otherwise, use the current
+    # ref to build as it'll be a release tag.
+    - uses: actions/checkout@v7
+      if: ${{ startsWith(github.ref, 'refs/heads/vapier/') }}
+      with:
+        ref: refs/heads/master
+    - uses: actions/checkout@v7
+      if: ${{ ! startsWith(github.ref, 'refs/heads/vapier/') }}
+
+    - name: PDCurses cache restore
+      uses: actions/cache/restore@v6
+      with:
+        key: pdcurses-x86_64-w64-mingw32-3.9
+        fail-on-cache-miss: true
+        path: |
+          PDCurses/curses.h
+          PDCurses/panel.h
+          PDCurses/wincon/pdcurses.a
+
+    # Cache gnulib to avoid hitting slow GNU git servers on every run.
+    - name: gnulib hash lookup
+      id: gnulib-hash-lookup
+      run: grep ^gnulib_hash= autogen.sh | tr -d '"' >> $GITHUB_OUTPUT
+    - name: gnulib cache restore
+      uses: actions/cache/restore@v6
+      with:
+        key: gnulib-${{ steps.gnulib-hash-lookup.outputs.gnulib_hash }}
+        fail-on-cache-miss: true
+        path: gnulib
+
+    # Hack it. :(
+    - name: Hot patching
+      run: |
+        set -ex
+        sed -i -e '/^modules="/a dirent-h rewinddir windows-stat-timespec' autogen.sh
+        echo '#define tgetstr(...) NULL' > term.h
+        echo '#include_next <curses.h>' > curses.h
+        echo '#define define_key(...)' >> curses.h
+
+    # Build it!
+    - run: sh -ex ./autogen.sh
+    - run: |
+        ./configure \
+          --disable-silent-rules \
+          --host=x86_64-w64-mingw32 \
+          NCURSESW_LIBS="-L$PWD/PDCurses/wincon -l:pdcurses.a" \
+          NCURSESW_CFLAGS="-I$PWD/PDCurses"
+    - run: make -O -j4 -k
+
+    # Upload it!
+    - run: mv src/nano.exe nano-windows-x64.exe
+    - name: Upload prebuilt
+      uses: actions/upload-artifact@v7
+      with:
+        path: nano-windows-x64.exe
+        archive: false
+
+  Windows:
+    # Can't get autogen.sh+configure to pass.
+    if: false
+    needs: [gnulib]
+    strategy:
+      matrix:
+        include:
+          - { sys: mingw64, env: x86_64 }
+          - { sys: mingw32, env: i686 }
+          - { sys: ucrt64,  env: ucrt-x86_64 }
+      fail-fast: false
+    runs-on: windows-latest
+    env:
+      CC: gcc
+      CFLAGS: -O2 -pipe -s
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+    - uses: msys2/setup-msys2@v2
+      with:
+        update: true
+        msystem: ${{matrix.sys}}
+        install: >-
+          autoconf
+          automake
+          gettext-devel
+          git
+          m4
+          make
+          mingw-w64-${{matrix.env}}-gcc
+          python3
+          sed
+          tar
+
+    # If building on vapier/ branches, force master.  Otherwise, use the current
+    # ref to build as it'll be a release tag.
+    - uses: actions/checkout@v7
+      if: ${{ startsWith(github.ref, 'refs/heads/vapier/') }}
+      with:
+        ref: refs/heads/master
+    - uses: actions/checkout@v7
+      if: ${{ ! startsWith(github.ref, 'refs/heads/vapier/') }}
+
+    # Cache gnulib to avoid hitting slow GNU git servers on every run.
+    - name: gnulib hash lookup
+      id: gnulib-hash-lookup
+      run: grep ^gnulib_hash= autogen.sh | tr -d '"' >> $GITHUB_OUTPUT
+    - name: gnulib cache restore
+      id: gnulib-cache-restore
+      uses: actions/cache/restore@v6
+      with:
+        key: gnulib-${{ steps.gnulib-hash-lookup.outputs.gnulib_hash }}
+        path: gnulib
+    - run: mkdir -p gnulib
+    - run: git init -b main
+      working-directory: gnulib
+    - name: Fetch gnulib
+      run: |
+        set -x
+        gnulib_hash=${{ steps.gnulib-hash-lookup.outputs.gnulib_hash }}
+        if ! git cat-file -e "$gnulib_hash"; then
+          git fetch git://git.sv.gnu.org/gnulib.git "$gnulib_hash"
+        fi
+      working-directory: gnulib
+    - run: git checkout -f ${{ steps.gnulib-hash-lookup.outputs.gnulib_hash }}
+      working-directory: gnulib
+    - name: gnulib cache save
+      uses: actions/cache/save@v6
+      with:
+        key: ${{ steps.gnulib-cache-restore.outputs.cache-primary-key }}
+        path: gnulib
+
+    # Build it!
+    - run: sed -i -e '2iset -xe' autogen.sh
+    - run: ./autogen.sh
+    - run: ./configure --disable-silent-rules
+    - run: make -O -j4
+
+    # Upload it!
+    - run: mv src/nano.exe nano-windows-${{matrix.sys}}.exe
+    - name: Upload prebuilt
+      uses: actions/upload-artifact@v7
+      with:
+        path: nano-windows-${{matrix.sys}}.exe
+        archive: false
