@@ -133,10 +133,6 @@ jobs:
     - name: Hot patching
       run: |
         set -ex
-        sed -i -e '/^modules="/a dirent-h rewinddir windows-stat-timespec' autogen.sh
-        echo '#define tgetstr(...) NULL' > term.h
-        echo '#include_next <curses.h>' > curses.h
-        echo '#define define_key(...)' >> curses.h
 
     # Build it!
     - run: sh -ex ./autogen.sh
